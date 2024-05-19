@@ -99,7 +99,7 @@ class BaseEnvironment(
             raise
         self._state = settled_state
 
-    async def start(self, last_environment: Optional[BaseEnvironment] = None):
+    async def start(self, last_environment: Optional[BaseEnvironment] = None, **kwargs):
         await self._attempt_state_transition(
             [
                 EnvironmentState.IDLE,
@@ -112,10 +112,10 @@ class BaseEnvironment(
             ],
             EnvironmentState.STARTING,
             EnvironmentState.RUNNING,
-            lambda: self._start(last_environment),
+            lambda: self._start(last_environment, **kwargs),
         )
 
-    async def stop(self, next_environment: Optional[BaseEnvironment] = None):
+    async def stop(self, next_environment: Optional[BaseEnvironment] = None, **kwargs):
         await self._attempt_state_transition(
             # Not sure if this is okay
             [
@@ -125,15 +125,17 @@ class BaseEnvironment(
             ],
             EnvironmentState.STOPPING,
             EnvironmentState.STOPPED,
-            lambda: self._stop(next_environment),
+            lambda: self._stop(next_environment, **kwargs),
         )
 
     @abc.abstractmethod
-    async def _start(self, last_environment: Optional[BaseEnvironment] = None):
+    async def _start(
+        self, last_environment: Optional[BaseEnvironment] = None, **kwargs
+    ):
         ...
 
     @abc.abstractmethod
-    async def _stop(self, next_environment: Optional[BaseEnvironment] = None):
+    async def _stop(self, next_environment: Optional[BaseEnvironment] = None, **kwargs):
         ...
 
     @abc.abstractmethod
@@ -162,10 +164,12 @@ class _BaseWebEnvironment(BaseEnvironment):
         self._check_static_path()
         self._runner = BrowserRunner(id, routes, url)
 
-    async def _start(self, last_environment=None):
-        await self._runner.start()
+    async def _start(
+        self, last_environment=None, map_localhost_ip: Optional[str] = None
+    ):
+        await self._runner.start(map_localhost_ip)
 
-    async def _stop(self, next_environment=None):
+    async def _stop(self, next_environment=None, **_):
         await self._runner.stop()
 
     def _check_static_path(self):
@@ -193,23 +197,27 @@ class _BaseWebEnvironment(BaseEnvironment):
 
 
 class WebEnvironment(_BaseWebEnvironment):
-    def __init__(self, id: str, path: Union[str, Path], url: Optional[str] = "/"):
-        super().__init__(id, path, {"/": path}, url)
+    def __init__(
+        self, id: str, path: Union[str, Path], url: Optional[str] = "/", **kwargs
+    ):
+        super().__init__(id, path, {"/": path}, url, **kwargs)
 
 
 class VideoEnvironment(_BaseWebEnvironment):
-    def __init__(self, id: str, path: Union[str, Path], video_filename: str):
+    def __init__(self, id: str, path: Union[str, Path], video_filename: str, **kwargs):
         super().__init__(
             id,
             path,
             {"/video": path, "/": PACKAGE_STATIC_PATH / "video-player"},
             f"/?url=/video/{video_filename}&posterUrl=/video/poster.jpg&id={id}",
+            **kwargs,
         )
 
 
 class DockerEnvironment(BaseEnvironment):
     _id: str
     _container: Optional[Container]
+    _ip: Optional[str]
     _video_devices: VideoDeviceManager
     _host_network: Optional[int]
     _image_exists: Optional[bool]
@@ -219,12 +227,13 @@ class DockerEnvironment(BaseEnvironment):
         self,
         id: str,
         image_id: str,
-        host_network: bool,
+        host_network: bool = False,
     ):
         super().__init__()
         self._id = id
         self._image_id = image_id
         self._container = None
+        self._ip = None
         self._video_devices = get_video_device_manager()
         self._host_network = host_network
         self._image_exists = None
@@ -233,7 +242,7 @@ class DockerEnvironment(BaseEnvironment):
         )
         self._data_path.mkdir(parents=True, exist_ok=True)
 
-    async def _start(self, last_environment=None):
+    async def _start(self, last_environment=None, **_):
         # For now, we will expose only our center webcam as /dev/video0 within
         # containers
         video_devices = [
@@ -264,6 +273,8 @@ class DockerEnvironment(BaseEnvironment):
             shm_size="1g",
             **network_config,
         )
+        self._container.reload()
+        self._ip = self._container.attrs["NetworkSettings"]["IPAddress"]
 
     def _kill_container_checked(self, container: Container):
         container.reload()
@@ -289,7 +300,7 @@ class DockerEnvironment(BaseEnvironment):
         await asyncio.sleep(1)
         list(map(self._kill_container_checked, matching_containers))
 
-    async def _stop(self, next_environment=None):
+    async def _stop(self, next_environment=None, **_):
         self._kill_container_checked(self._container)
         await self.shutdown_by_tag()
         self._container = None
@@ -338,6 +349,73 @@ class DockerEnvironment(BaseEnvironment):
 
             self._image_exists = True
             return True
+
+    @property
+    def ip(self) -> Optional[str]:
+        return self._ip
+
+
+class StackEnvironment(BaseEnvironment):
+    _docker_environment: Optional[DockerEnvironment]
+    _web_environment: Optional[WebEnvironment]
+
+    def __init__(
+        self,
+        id: str,
+        image_id: Optional[str],
+        path: Optional[Union[str, Path]],
+        url: Optional[str] = "/",
+    ):
+        if image_id is None and path is None:
+            raise ValueError(
+                "Must specify either 'image_id' or 'path' for stack experience"
+            )
+
+        super().__init__()
+        self._docker_environment = DockerEnvironment(id, image_id) if image_id else None
+        self._web_environment = WebEnvironment(id, path, url) if path else None
+
+    async def _start(self, last_environment: Optional[BaseEnvironment] = None, **_):
+        docker_ip = None
+        if self._docker_environment:
+            await self._docker_environment.start(last_environment)
+            docker_ip = self._docker_environment.ip
+            if docker_ip is None:
+                raise ValueError("Couldn't read IP from Docker environment")
+        if self._web_environment:
+            await self._web_environment.start(
+                last_environment, map_localhost_ip=docker_ip
+            )
+
+    async def _stop(self, next_environment: Optional[BaseEnvironment] = None, **_):
+        if self._web_environment:
+            await self._web_environment.stop(next_environment)
+        if self._docker_environment:
+            await self._docker_environment.stop(next_environment)
+
+    async def state(self) -> EnvironmentState:
+        docker_state = None
+        if self._docker_environment:
+            docker_state = await self._docker_environment.state()
+
+        web_state = None
+        if self._web_environment:
+            web_state = await self._web_environment.state()
+
+        if docker_state is None and web_state is None:
+            # This shouldn't be possible
+            return EnvironmentState.FAILED
+
+        if docker_state and not web_state:
+            return docker_state
+
+        if web_state and not docker_state:
+            return web_state
+
+        if docker_state == web_state:
+            return docker_state
+
+        return EnvironmentState.FAILED
 
 
 class CaptureEnvironment(BaseEnvironment):

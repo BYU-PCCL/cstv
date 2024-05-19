@@ -22,6 +22,7 @@ from .environments import (
     DockerEnvironment,
     VideoEnvironment,
     WebEnvironment,
+    StackEnvironment,
 )
 
 _DEFAULT_LIFETIME = 60
@@ -30,6 +31,7 @@ _CONFIG_FILENAME = "config"
 
 
 class ExperienceType(str, Enum):
+    Stack = "stack"
     Docker = "docker"
     Web = "web"
     Video = "video"
@@ -94,6 +96,35 @@ class BaseExperience(BaseModel, abc.ABC, Generic[EnvironmentType]):
     @abc.abstractmethod
     def _create_environment(self) -> BaseEnvironment:
         ...
+
+
+class StackExperience(BaseExperience[StackEnvironment]):
+    """Combines web and docker experiences"""
+
+    type = ExperienceType.Stack
+    image_id: Optional[str]
+    url: Optional[str]
+    layout = DisplayLayout.Wide
+
+    @root_validator(pre=True)
+    def validate_has_environment(cls, values):
+        if (
+            "docker_image" not in values
+            and not (values["experience_path"] / "static").exists()
+        ):
+            raise ValueError(
+                "'docker_image' parameter or 'static' directory required for stack"
+            )
+        return values
+
+    def _create_environment(self) -> BaseEnvironment:
+        static_path = self.experience_path / "static"
+        return StackEnvironment(
+            self.id,
+            self.image_id,
+            static_path if static_path.exists() else None,
+            self.url,
+        )
 
 
 class DockerExperience(BaseExperience[DockerEnvironment]):
@@ -216,6 +247,7 @@ class CurrentExperience:
 
 
 experience_type_map: Dict[ExperienceType, Type[BaseExperience]] = {
+    ExperienceType.Stack: StackExperience,
     ExperienceType.Docker: DockerExperience,
     ExperienceType.Web: WebExperience,
     ExperienceType.Video: VideoExperience,

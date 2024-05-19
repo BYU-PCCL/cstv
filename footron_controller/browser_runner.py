@@ -25,7 +25,12 @@ class BrowserRunner:
     _runner = Optional[AppRunner]
     _site = Optional[TCPSite]
 
-    def __init__(self, id: str, routes: Dict[str, str], url: str = "/"):
+    def __init__(
+        self,
+        id: str,
+        routes: Dict[str, str],
+        url: str = "/",
+    ):
         self._id = id
         self._app = web.Application(middlewares=[self.static_serve])
         self._routes = {route.rstrip("/"): path for route, path in routes.items()}
@@ -33,7 +38,7 @@ class BrowserRunner:
         self._browser_process = None
 
     def _create_url(self):
-        base_url = urllib.parse.urljoin(f"http://localhost:{self._port}", self._url)
+        base_url = urllib.parse.urljoin(f"http://localhost", self._url)
         parsed_url = urllib.parse.urlsplit(base_url)
         query_params = urllib.parse.parse_qsl(parsed_url.query)
         query_params.append(
@@ -50,8 +55,14 @@ class BrowserRunner:
             )
         )
 
-    def _start_browser(self):
-        self._browser_process = subprocess.Popen([WEB_SHELL_PATH, self._create_url()])
+    def _start_browser(self, map_localhost_ip: Optional[str] = None):
+        host_rules = f"MAP localhost:80 localhost:{self._port}"
+        if map_localhost_ip:
+            host_rules += f", MAP localhost {map_localhost_ip}"
+        host_rules_arg = f"--host-rules={host_rules}"
+        self._browser_process = subprocess.Popen(
+            [WEB_SHELL_PATH, self._create_url(), host_rules_arg]
+        )
 
     async def _stop_browser(self):
         if not self._browser_process:
@@ -116,9 +127,9 @@ class BrowserRunner:
             logging.error("Error while stopping static server:")
             logging.exception(e)
 
-    async def start(self):
+    async def start(self, map_localhost_ip: Optional[str] = None):
         await self._start_static_server()
-        self._start_browser()
+        self._start_browser(map_localhost_ip)
 
     async def stop(self):
         await self._stop_browser()
